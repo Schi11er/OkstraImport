@@ -1,6 +1,7 @@
 import os
 import re
 import requests
+import threading
 from dotenv import load_dotenv
 import logging
 
@@ -10,17 +11,47 @@ GRAPHQL_ENDPOINT = os.getenv("DATACAT_URL") + "/graphql"
 USERNAME = os.getenv("DATACAT_USERNAME")
 PASSWORD = os.getenv("DATACAT_PASSWORD")
 
+_graphq_request_lock = threading.Lock()
+_graphq_request_condition = threading.Condition(_graphq_request_lock)
+_pending_graphql_requests = 0
+
+
+def _begin_graphql_request():
+	global _pending_graphql_requests
+	with _graphq_request_condition:
+		_pending_graphql_requests += 1
+
+
+def _end_graphql_request():
+	global _pending_graphql_requests
+	with _graphq_request_condition:
+		_pending_graphql_requests = max(0, _pending_graphql_requests - 1)
+		_graphq_request_condition.notify_all()
+
+
+def wait_for_pending_graphql_requests():
+	with _graphq_request_condition:
+		while _pending_graphql_requests > 0:
+			_graphq_request_condition.wait()
+
 def graphql_request(query, variables=None, token=None):
 	headers = {"Content-Type": "application/json"}
 	if token:
 		headers["Authorization"] = f"Bearer {token}"
-	response = requests.post(
-		GRAPHQL_ENDPOINT,
-		json={"query": query, "variables": variables},
-		headers=headers
-	)
-	response.raise_for_status()
-	return response.json()
+	_begin_graphql_request()
+	try:
+		response = requests.post(
+			GRAPHQL_ENDPOINT,
+			json={"query": query, "variables": variables},
+			headers=headers,
+			timeout=60
+		)
+		response.raise_for_status()
+		if "errors" in response.json():
+			logging.error(f"GraphQL-Fehler: {response.json()['errors'][0]['message']}")
+		return response.json()
+	finally:
+		_end_graphql_request()
 
 def login():
 	query = """
@@ -30,6 +61,8 @@ def login():
 	"""
 	variables = {"username": USERNAME, "password": PASSWORD}
 	result = graphql_request(query, variables)
+	if "errors" in result:
+		logging.error(f"Fehler beim Login: {result['errors'][0]['message']}")
 	return result["data"]["login"]
 
 def create_catalog_entry(token, catalogEntryType, properties, tagId):
@@ -43,7 +76,7 @@ def create_catalog_entry(token, catalogEntryType, properties, tagId):
 	variables = {"input": {"catalogEntryType": catalogEntryType, "properties": properties, "tags": tagId}}
 	result = graphql_request(query, variables, token)
 	if "errors" in result:
-		# logging.error(f"Fehler beim Erstellen des Katalogeintrags: {result}")
+		logging.error(f"Fehler beim Erstellen des Katalogeintrags: {result['errors'][0]['message']}")
 		return None
 	else:
 		return result["data"]["createCatalogEntry"]["catalogEntry"]
