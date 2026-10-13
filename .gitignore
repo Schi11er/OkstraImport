@@ -6,3 +6,5 @@ __pycache__/
 .env
 logfile.txt
 Mapping_GeoInfoDok.md
+
+relationship_tasks.txt

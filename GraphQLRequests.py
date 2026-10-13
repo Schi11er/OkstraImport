@@ -34,24 +34,53 @@ def wait_for_pending_graphql_requests():
 		while _pending_graphql_requests > 0:
 			_graphq_request_condition.wait()
 
-def graphql_request(query, variables=None, token=None):
-	headers = {"Content-Type": "application/json"}
-	if token:
-		headers["Authorization"] = f"Bearer {token}"
-	_begin_graphql_request()
-	try:
-		response = requests.post(
-			GRAPHQL_ENDPOINT,
-			json={"query": query, "variables": variables},
-			headers=headers,
-			timeout=60
-		)
-		response.raise_for_status()
-		if "errors" in response.json():
-			logging.error(f"GraphQL-Fehler: {response.json()['errors'][0]['message']}")
-		return response.json()
-	finally:
-		_end_graphql_request()
+class GraphQLTimeoutError(Exception):
+    """Request timed out - unklar ob die Operation serverseitig trotzdem ausgeführt wurde."""
+    pass
+
+
+class GraphQLError(Exception):
+    """GraphQL-Response enthielt einen 'errors'-Block."""
+    def __init__(self, errors):
+        self.errors = errors
+        super().__init__(errors[0].get("message", str(errors)))
+
+
+def graphql_request(query, variables=None, token=None, timeout=180, raise_on_error=True):
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    _begin_graphql_request()
+    try:
+        response = requests.post(
+            GRAPHQL_ENDPOINT,
+            json={"query": query, "variables": variables},
+            headers=headers,
+            timeout=timeout
+        )
+        response.raise_for_status()
+        data = response.json()
+        
+        if variables.get("id") == "OkstraId" and "errors" in data:
+            return data  # Spezielle Behandlung für OkstraId-Fehler, um die Verarbeitung fortzusetzen
+
+        if "errors" in data:
+            logging.error(f"GraphQL-Fehler: {data['errors'][0]['message']}")
+            if raise_on_error:
+                raise GraphQLError(data["errors"])
+
+        return data
+
+    except requests.exceptions.ReadTimeout as e:
+        # logging.warning(
+        #     f"GraphQL-Request-Timeout (timeout={timeout}s). "
+        #     f"Operation wurde möglicherweise serverseitig trotzdem ausgeführt."
+        # )
+        raise GraphQLTimeoutError(str(e)) from e
+
+    finally:
+        _end_graphql_request()
 
 def login():
 	query = """
@@ -61,8 +90,8 @@ def login():
 	"""
 	variables = {"username": USERNAME, "password": PASSWORD}
 	result = graphql_request(query, variables)
-	if "errors" in result:
-		logging.error(f"Fehler beim Login: {result['errors'][0]['message']}")
+	# if "errors" in result:
+		# logging.error(f"Fehler beim Login: {result['errors'][0]['message']}")
 	return result["data"]["login"]
 
 def create_catalog_entry(token, catalogEntryType, properties, tagId):
@@ -74,12 +103,15 @@ def create_catalog_entry(token, catalogEntryType, properties, tagId):
 	}
 	"""
 	variables = {"input": {"catalogEntryType": catalogEntryType, "properties": properties, "tags": tagId}}
+	# variables = {"input": {"catalogEntryType": catalogEntryType, "properties": properties}}
 	result = graphql_request(query, variables, token)
-	if "errors" in result:
-		logging.error(f"Fehler beim Erstellen des Katalogeintrags: {result['errors'][0]['message']}")
-		return None
-	else:
-		return result["data"]["createCatalogEntry"]["catalogEntry"]
+	return result
+	# if "errors" in result:
+	# 	# logging.error(f"Fehler beim Erstellen des Katalogeintrags: {result['errors'][0]['message']}")
+	# 	return None
+	# else:
+	# 	return result["data"]["createCatalogEntry"]["catalogEntry"]
+ 	
 	
 
 def create_relationship(token, relationshipType, properties, fromId, toIds):
@@ -143,3 +175,17 @@ def add_tag(token, entryId, tagId):
 		return None
 	else:
 		return result["data"]["addTag"]["catalogEntry"]
+
+def validate_entity(token, entityId):
+	query = """
+	query ValidateEntity($id: ID!) {
+		node(id: $id) {
+			id
+		}
+	}
+	"""
+	variables = {"id": entityId}
+	result = graphql_request(query, variables, token)
+	if result["data"]:
+		return True
+	return False

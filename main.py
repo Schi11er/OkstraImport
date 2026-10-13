@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from GraphQLRequests import (add_tag, create_catalog_entry, create_relationship, create_tag,
-    get_tag, login)
+    get_tag, login, validate_entity, GraphQLTimeoutError)
 
 # Logfile zu Beginn leeren
 open("logfile.txt", "w").close()
@@ -28,10 +28,10 @@ logging.basicConfig(
 
 # Einfache Umschaltung für Testläufe:
 # True -> nur XTD-Wert-Entities werden neu erstellt, danach nur deren Dictionary-Beziehungen
-ONLY_RECREATE_XTD_VALUE_ENTITIES = True
+ONLY_RECREATE_XTD_VALUE_ENTITIES = False
 RELATIONSHIP_AUTH_COOLDOWN_SECONDS = 150
 RELATIONSHIP_AUTH_COOLDOWN_LONG_SECONDS = 300
-RELATIONSHIP_MANUAL_PAUSE_INTERVAL = 100
+RELATIONSHIP_MANUAL_PAUSE_INTERVAL = 200
 
 relation_cooldown_until = 0.0
 relation_auth_failures = 0
@@ -102,7 +102,7 @@ def find_datatype(attribute, ns):
     if name is None:
         name = "EAJava_Boolean"
         
-    if name in ("EAJava_CharacterString","EAID_AF7C81A6_B1C1_4469_A09F_B97989024A14"):
+    if name in ("EAJava_CharacterString","EAID_AF7C81A6_B1C1_4469_A09F_B97989024A14","EAnone_CharacterString"):
         return "XTD_STRING"
     elif name in ("EAJava_Integer", "EAID_ED4B232F_5EF1_4793_9DAE_32DC0D70A047"):
         return "XTD_INTEGER"
@@ -159,7 +159,7 @@ def ensure_auth_token(reason):
 def refresh_auth_token(reason):
     token = login()
     store_auth_token(token)
-    logging.info("Auth-Token erneuert%s: %s", f" ({reason})" if reason else "", mask_auth_token(token))
+    # logging.info("Auth-Token erneuert%s: %s", f" ({reason})" if reason else "", mask_auth_token(token))
     return token
 
 def prepare_entity_attributes(domain, entity_type, ns):
@@ -248,39 +248,63 @@ def create_entry(attributes, tagId):
     
     for attempt in range(1, max_retries + 1):
         try:
-            result = create_catalog_entry(token, entityType.value[1], properties, [entityType.value[2], tagId])
-            if result is None:
-                # Retry-Logik für add_tag
-                # max_retries = 5
-                addTag = None
-                
-                for tag_attempt in range(1, max_retries + 1):
-                    with add_tag_lock:
-                        addTag = add_tag(token, properties["id"], tagId)
-                    if addTag is not None:
-                        # logging.info(f"Tag für '{properties['names']['value']}' erfolgreich hinzugefügt nach Versuch {attempt}")
-                        break
-                    
-                    if tag_attempt < max_retries:
-                        wait_time = tag_attempt * 1.0  # Progressiv längere Wartezeit
-                        time.sleep(wait_time)
-                    else:
-                        # Alle Versuche fehlgeschlagen
-                        error_msg = f"add_tag fehlgeschlagen nach {max_retries} Versuchen für Entity {properties['names']['value']} (ID: {properties['id']})"
-                        logging.error(error_msg)
-                        raise Exception(error_msg)
-            
-            if entityType == EntityType.DICTIONARY:
-                return None  # Keine ID für Dictionary
+            create_catalog_entry(token, entityType.value[1], properties, [entityType.value[2], tagId])
             return properties["id"]
         except Exception as e:
             status_code = get_http_status_code(e)
             auth_error = is_auth_error(e)
             lock_error = is_lock_related_error(e)
+            timeout_error = isinstance(e, GraphQLTimeoutError)
+            id_in_use_error = "id is already in use" in str(e).lower()
+
+            if id_in_use_error:
+                return properties["id"]
+                # try:
+                #     if validate_entity(token, properties["id"]):
+                #         return properties["id"]
+
+                #     logging.warning(
+                #         "'Id is already in use' erhalten, aber Entity ist noch nicht verifizierbar: %s (%s)",
+                #         properties.get("names", {}).get("value"),
+                #         properties["id"],
+                #     )
+                # except Exception as validation_error:
+                #     logging.warning(
+                #         "Validierung nach 'Id is already in use' fehlgeschlagen für %s (%s): %s",
+                #         properties.get("names", {}).get("value"),
+                #         properties["id"],
+                #         validation_error,
+                #     )
+
+                # if attempt < max_retries:
+                #     time.sleep(random.uniform(1, 5))
+                #     continue
+
+            if timeout_error:
+                try:
+                    if validate_entity(token, properties["id"]):
+                        return properties["id"]
+
+                    logging.warning(
+                        "Read Timeout bei Entity-Erstellung, Eintrag noch nicht bestätigt: %s (%s)",
+                        properties.get("names", {}).get("value"),
+                        properties["id"],
+                    )
+                except Exception as validation_error:
+                    logging.warning(
+                        "Validierung nach Read Timeout fehlgeschlagen für %s (%s): %s",
+                        properties.get("names", {}).get("value"),
+                        properties["id"],
+                        validation_error,
+                    )
+
+                if attempt < max_retries:
+                    time.sleep(random.uniform(1, 5))
+                    continue
             
             # Bei 401: Token erneuern und erneut versuchen
             if status_code == 401 and attempt < max_retries:
-                token = refresh_auth_token("Entity-Erstellung")
+                # token = refresh_auth_token("Entity-Erstellung")
                 time.sleep(random.uniform(0.5, 1.5))
                 continue
 
@@ -406,24 +430,6 @@ def acquire_relation_node_scope(from_id, to_ids):
         for node_lock in reversed(node_locks):
             node_lock.release()
 
-def execute_relationship_batch_serial(relationship_tasks, total_count, total_offset=0):
-    processed_count = 0
-    for rel_args in relationship_tasks:
-        processed_count += 1
-
-        # Bereits exisiterende Beziehungen überspringen
-        if rel_args[0] == RelType.PROPERTIES or rel_args[0] == RelType.POSSIBLE_VALUES or rel_args[0] == RelType.UNITS:
-            continue
-
-        create_relationship_with_retry(rel_args)
-
-        absolute_count = total_offset + processed_count
-        if processed_count % RELATIONSHIP_MANUAL_PAUSE_INTERVAL == 0 or processed_count == len(relationship_tasks):
-            logging.info("Relations-Fortschritt: %s/%s verarbeitet", absolute_count, total_count)
-
-    return processed_count
-
-
 def execute_relationship_batch_parallel(relationship_tasks, total_count, total_offset=0, max_workers=4, max_iterations=5):
     if not relationship_tasks:
         return 0
@@ -443,26 +449,32 @@ def execute_relationship_batch_parallel(relationship_tasks, total_count, total_o
         )
 
         round_failed_tasks = []
-        worker_count = min(max_workers, len(pending_tasks))
 
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            future_to_rel = {executor.submit(create_relationship_with_retry, rel_args): rel_args for rel_args in pending_tasks}
+        for chunk_start in range(0, len(pending_tasks), RELATIONSHIP_MANUAL_PAUSE_INTERVAL):
+            chunk = pending_tasks[chunk_start:chunk_start + RELATIONSHIP_MANUAL_PAUSE_INTERVAL]
+            worker_count = min(max_workers, len(chunk))
 
-            for future in as_completed(future_to_rel):
-                processed_count += 1
-                rel_args = future_to_rel[future]
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                future_to_rel = {executor.submit(create_relationship_with_retry, rel_args): rel_args for rel_args in chunk}
 
-                try:
-                    result = future.result()
-                    if not result:
+                for future in as_completed(future_to_rel):
+                    processed_count += 1
+                    rel_args = future_to_rel[future]
+
+                    try:
+                        result = future.result()
+                        if not result:
+                            round_failed_tasks.append(rel_args)
+                    except Exception as e:
+                        logging.error("Fehler bei paralleler Relationsverarbeitung: %s, Task: %s", e, rel_args)
                         round_failed_tasks.append(rel_args)
-                except Exception as e:
-                    logging.error("Fehler bei paralleler Relationsverarbeitung: %s, Task: %s", e, rel_args)
-                    round_failed_tasks.append(rel_args)
+                        time.sleep(random.uniform(10, 30))
 
-                absolute_count = total_offset + processed_count
-                if processed_count % RELATIONSHIP_MANUAL_PAUSE_INTERVAL == 0 or processed_count == len(relationship_tasks):
-                    logging.info("Relations-Fortschritt: %s/%s verarbeitet", absolute_count, total_count)
+            absolute_count = total_offset + processed_count
+            logging.info("Relations-Fortschritt: %s/%s verarbeitet", absolute_count, total_count)
+
+            # # Jetzt sicher pausieren - kein Thread greift mehr auf Neo4j zu
+            # time.sleep(30)
 
         if round_failed_tasks:
             logging.warning(
@@ -482,47 +494,6 @@ def execute_relationship_batch_parallel(relationship_tasks, total_count, total_o
 
     return processed_count
 
-
-def set_relationship_cooldown(seconds, reason):
-    global relation_cooldown_until
-    relation_cooldown_until = max(relation_cooldown_until, time.time() + seconds)
-    logging.warning("Setze globalen Cooldown für Beziehungen auf %.0f Sekunden wegen: %s", seconds, reason)
-
-
-def handle_relation_auth_retry(error_message, attempt, max_retries, rel_type, from_id, to_ids, retry_reason):
-    global relation_auth_failures
-    global relation_auth_failure_streak
-
-    relation_auth_failures += 1
-    relation_auth_failure_streak += 1
-
-    cooldown_seconds = RELATIONSHIP_AUTH_COOLDOWN_SECONDS if relation_auth_failures == 1 else RELATIONSHIP_AUTH_COOLDOWN_LONG_SECONDS
-    set_relationship_cooldown(cooldown_seconds, error_message)
-
-    if relation_auth_failure_streak >= 3:
-        logging.error("Mehrere aufeinanderfolgende Auth-Fehler bei Beziehungen, breche die Relationsphase ab: %s", error_message)
-        logging.error("Letzte Beziehung: type=%s fromId=%s toIds=%s", rel_type, from_id, to_ids)
-        raise SystemExit(f"Programm abgebrochen wegen wiederholter Auth-Fehler bei Beziehungen: {error_message}")
-
-    if attempt >= max_retries:
-        logging.error("Auth-/403-Fehler bei Beziehung nach %s Versuchen - überspringe Eintrag: %s", max_retries, error_message)
-        return None
-
-    auth_pause_seconds = random.uniform(120, 180)
-    logging.warning(
-        "Auth-/403-Fehler %s, warte %.0f Sekunden vor erneutem Versuch %s/%s: type=%s fromId=%s toIds=%s",
-        retry_reason,
-        auth_pause_seconds,
-        attempt,
-        max_retries,
-        rel_type,
-        from_id,
-        to_ids,
-    )
-    time.sleep(auth_pause_seconds)
-    return refresh_auth_token("Beziehung")
-
-
 def create_relationship_with_retry(rel_args):
     rel_type, properties, from_id, to_ids = rel_args
     auth_token = ensure_auth_token("Relationen Start")
@@ -538,10 +509,10 @@ def create_relationship_with_retry(rel_args):
     if not new_to_ids:
         return True
 
-    with acquire_relation_node_scope(from_id, new_to_ids):
-        max_retries = 5
-        for attempt in range(1, max_retries + 1):
-            try:
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            with acquire_relation_node_scope(from_id, new_to_ids):
                 result = create_relationship(auth_token, rel_type, properties, from_id, new_to_ids)
                 if result and isinstance(result, dict) and 'errors' in result:
                     error_messages = str(result['errors'])
@@ -560,29 +531,34 @@ def create_relationship_with_retry(rel_args):
                     time.sleep(0.25)
 
                 return True
-            except Exception as e:
-                error_str = str(e).lower()
-                # logging.warning("Fehler beim Anlegen der Beziehung: %s", error_str)
+        except Exception as e:
+            status_code = get_http_status_code(e)
+            auth_error = is_auth_error(e)
 
-                if attempt < max_retries:
-                    waiting = random.uniform(3, 8)
-                    time.sleep(waiting)
-                    continue                
+            if (status_code == 401 or auth_error) and attempt < max_retries:
+                auth_token = refresh_auth_token("Relation-401")
+                time.sleep(random.uniform(1, 5))
+                continue
+            
+            if attempt < max_retries:
+                waiting = random.uniform(3, 8)
+                time.sleep(waiting)
+                continue                
 
-                logging.error("Fehler beim Anlegen der Beziehung: %s\nBeziehungsparameter: type=%s, fromId=%s, toId=%s", e, rel_type, from_id, new_to_ids)
-                return False
+            logging.error("Fehler beim Anlegen der Beziehung: %s\nBeziehungsparameter: type=%s, fromId=%s, toId=%s", e, rel_type, from_id, new_to_ids)
+            return False
 
     return False
  
  #
  # --------------Hauptprogramm----------------
+ # Enthält die Logik zum Einlesen der XMI-Datei
  #
                 
 if __name__ == "__main__":
     start = time.time()
     # Login
     token = refresh_auth_token("Initial-Login")
-    # logging.info("Login erfolgreich")
 
     # Find or create tag
     tagId = "OkstraId"
@@ -594,18 +570,10 @@ if __name__ == "__main__":
 
 
     tag = get_tag(token, tagId)
-    # logging.info("Tag abgerufen:", tag)
     if not tag:
         logging.info("Tag nicht gefunden, erstelle neuen Tag.")
         tag = create_tag(token, tagName, tagId)
         logging.info(f"Tag erstellt: {tag}")
-    
-    # Validierung, dass tagId korrekt ist
-    if tagId is None:
-        logging.error("tagId ist None - kann nicht fortfahren")
-        exit(1)
-    
-    # logging.info(f"Verwende tagId: {tagId}")
 
     ns = {}
     for event, elem in ET.iterparse(file_path, events=("start-ns", "start")):
@@ -671,7 +639,7 @@ if __name__ == "__main__":
       
     # Create Dictionary from FeatureCatalogue
     dictAttrs = prepare_entity_attributes(dictionary, EntityType.DICTIONARY, ns)
-    # create_entry(dictAttrs, token, tagId)
+    create_entry(dictAttrs, tagId)
     dictionaryId = dictAttrs["id"]
     
     # Schlüsseltabellen zuerst verarbeiten
@@ -683,7 +651,7 @@ if __name__ == "__main__":
             if attrs1.get("is_new", True):
                 tasks.append(attrs1)
             key_tables.append(attrs1["id"])
-    # e = 0
+
     for child in dictionary.findall(XmlTag.PACKAGEDELEMENT.tag(ns)):
         if child.get("name") != "Schluesseltabellen":
             attrs1 = prepare_entity_attributes(child, EntityType.THEMA, ns)
@@ -795,9 +763,6 @@ if __name__ == "__main__":
                     log_unknown_schema_type(2, classEl.get(f"{{{ns['xmi']}}}type")) 
         
             relationship_tasks.append((RelType.RELATIONSHIP_TO_SUBJECT, rel_to_subj_props, attrs1["id"], collected_class_ids))
-        # e += 1
-        # if e == 1:
-        #     break
             
     for assId, (dstMember, scrMember) in collected_associations.items():  
         (scrId, scrName) = collected_association_props.get(scrMember, (None, None))
@@ -829,6 +794,7 @@ if __name__ == "__main__":
 
     # Relationship-Tasks optimieren (zusammenführen)
     relationship_tasks = optimize_relationship_tasks(relationship_tasks)
+    random.shuffle(tasks)
     logging.info(f"Anzahl der Relationen nach Optimierung: {len(relationship_tasks)}")
     simple_relationship_tasks, complex_relationship_tasks = split_relationship_tasks(relationship_tasks)
     logging.info(f"Einfache Relationen: {len(simple_relationship_tasks)}")
@@ -842,101 +808,66 @@ if __name__ == "__main__":
 
     # Optimale Anzahl an Threads
     cpu_count = os.cpu_count()
-    optimal_workers = min(max(cpu_count or 1, 2), 16)
+    optimal_workers = 4 # min(max(cpu_count or 1, 2), 16)
 
     logging.info(f"CPU-Kerne: {cpu_count}, Verwende {optimal_workers} Worker")
 
-    # if ONLY_RECREATE_XTD_VALUE_ENTITIES:
-    #     logging.info("Testlauf aktiv: nur XTD-Wert-Entities und deren Dictionary-Beziehungen werden verarbeitet")
-    #     xtd_value_tasks = [task for task in tasks if task.get("entityType") == EntityType.WERT]
-    #     xtd_value_ids = []
-
-    #     start0 = time.time()
-    #     with ThreadPoolExecutor(max_workers=optimal_workers) as executor:
-    #         future_to_task = {executor.submit(create_entry, task, tagId): task for task in xtd_value_tasks}
-    #         processed_entities = 0
-
-    #         for future in as_completed(future_to_task):
-    #             processed_entities += 1
-    #             try:
-    #                 id = future.result()
-    #                 if id:
-    #                     xtd_value_ids.append(id)
-    #             except Exception as e:
-    #                 task = future_to_task[future]
-    #                 logging.error(f"Fehler bei Entity-Erstellung: {e}, Task: {task}")
-
-    #             if processed_entities % 1000 == 0 or processed_entities == len(future_to_task):
-    #                 logging.info(f"Entity-Fortschritt: {processed_entities}/{len(future_to_task)} verarbeitet")
-
-    #     logging.info(f"Dauer Erstellung XTD-Wert-Entities: {time.time() - start0:.2f} Sekunden")
-
-    #     # start1 = time.time()
-    #     # for idx, id in enumerate(xtd_value_ids, 1):
-    #     #     if idx % 500 == 0:
-    #     #         token = login()
-    #     #         logging.info(f"Re-Login nach {idx} Dictionary-Relationen durchgeführt - Warte 5 Sekunden...")
-    #     #         time.sleep(5)
-    #     #     create_relationship_with_retry((RelType.DICTIONARY, None, id, [dictionaryId]), token)
-    #     #     if idx % 1000 == 0 or idx == len(xtd_value_ids):
-    #     #         logging.info(f"Dictionary-Relationen-Fortschritt: {idx}/{len(xtd_value_ids)} verarbeitet")
-    #     # logging.info(f"Dauer Erstellung Dictionary-Relationen für XTD-Wert-Entities: {time.time() - start1:.2f} Sekunden")
-    # else:
-    #     start0 = time.time()
-    #     # Parallelisierte Entity-Erstellung
-    #     with ThreadPoolExecutor(max_workers=optimal_workers) as executor:
-    #         # Alle Tasks als Futures starten
-    #         future_to_task = {executor.submit(create_entry, task, tagId): task for task in tasks}
-    #         processed_entities = 0
-            
-    #         # Ergebnisse sammeln
-    #         for future in as_completed(future_to_task):
-    #             processed_entities += 1
-    #             try:
-    #                 id = future.result()
-    #                 if id:
-    #                     entry_ids.append(id)
-    #             except Exception as e:
-    #                 task = future_to_task[future]
-    #                 logging.error(f"Fehler bei Entity-Erstellung: {e}, Task: {task}")
-
-    #             if processed_entities % 1000 == 0 or processed_entities == len(future_to_task):
-    #                 logging.info(f"Entity-Fortschritt: {processed_entities}/{len(future_to_task)} verarbeitet")
-
-    #     logging.info(f"Dauer Erstellung Entities: {time.time() - start0:.2f} Sekunden")
+    start0 = time.time()
+    # Parallelisierte Entity-Erstellung
+    with ThreadPoolExecutor(max_workers=optimal_workers) as executor:
+        # Alle Tasks als Futures starten
+        future_to_task = {executor.submit(create_entry, task, tagId): task for task in tasks}
+        processed_entities = 0
         
-    #     # start1 = time.time()
-    #     # # Dictionary-Beziehungen erstellen
-    #     # for idx, id in enumerate(entry_ids, 1):
-    #     #     # Re-Login alle 500 Einträge zur Vermeidung von Token-Ablauf
-    #     #     if idx % 500 == 0:
-    #     #         token = login()
-    #     #         logging.info(f"Re-Login nach {idx} Dictionary-Relationen durchgeführt - Warte 5 Sekunden...")
-    #     #         time.sleep(5)
-    #     #     create_relationship_with_retry((RelType.DICTIONARY, None, id, [dictionaryId]), token)
-    #     #     if idx % 1000 == 0 or idx == len(entry_ids):
-    #     #         logging.info(f"Dictionary-Relationen-Fortschritt: {idx}/{len(entry_ids)} verarbeitet")
-    #     # logging.info(f"Dauer Erstellung Dictionary-Relationen: {time.time() - start1:.2f} Sekunden")
+        # Ergebnisse sammeln
+        for future in as_completed(future_to_task):
+            processed_entities += 1
+            try:
+                id = future.result()
+                if id:
+                    entry_ids.append(id)
+            except Exception as e:
+                task = future_to_task[future]
+                logging.error(f"Fehler bei Entity-Erstellung: {e}, Task: {task}")
+
+            if processed_entities % 500 == 0 or processed_entities == len(future_to_task):
+                logging.info(f"Entity-Fortschritt: {processed_entities}/{len(future_to_task)} verarbeitet")
+
+    logging.info(f"Dauer Erstellung Entities: {time.time() - start0:.2f} Sekunden")
+    
+    start1 = time.time()
+    refresh_auth_token("Dictionary-Relationen-Erstellung")
+    # Dictionary-Beziehungen erstellen
+    for idx, id in enumerate(entry_ids, 1):
+        create_relationship_with_retry((RelType.DICTIONARY, None, id, [dictionaryId]))
+        if idx % 500 == 0 or idx == len(entry_ids):
+            logging.info(f"Dictionary-Relationen-Fortschritt: {idx}/{len(entry_ids)} verarbeitet")
+            time.sleep(5)
+    logging.info(f"Dauer Erstellung Dictionary-Relationen: {time.time() - start1:.2f} Sekunden")
     
     start2 = time.time()
 
-    token = ensure_auth_token("Entity-Erstellung")
+    refresh_auth_token("Entity-Erstellung")
     logging.info("Auth-Token für Relationsphase verwendet: %s", mask_auth_token(token))
 
     logging.info(f"Starte Verarbeitung von {total_relationship_count} Relationen")
 
-    # processed_simple = execute_relationship_batch_serial(
-    #     simple_relationship_tasks,
-    #     total_relationship_count,
-    #     total_offset=0,
-    # )
+    refresh_auth_token("Vor einfacher Relationsphase")
+    execute_relationship_batch_parallel(
+        simple_relationship_tasks,
+        total_relationship_count,
+        total_offset=0,
+        max_workers=optimal_workers,
+    )
+    
+    time.sleep(60)  
 
+    refresh_auth_token("Vor komplexer RELATIONSHIP_TO_SUBJECT-Phase")
     if complex_relationship_tasks:
         logging.info("Starte parallele Verarbeitung der komplexen RELATIONSHIP_TO_SUBJECT-Relationen")
         execute_relationship_batch_parallel(
             complex_relationship_tasks,
             total_relationship_count,
-            # total_offset=processed_simple,
             total_offset=len(simple_relationship_tasks),
             max_workers=optimal_workers,
         )
@@ -944,5 +875,7 @@ if __name__ == "__main__":
     logging.info(f"Dauer Erstellung Relationen: {time.time() - start2:.2f} Sekunden")
     logging.info(f"Gesamtdauer: {time.time() - start:.2f} Sekunden")
 
+# Prüfen:
 # create dictionary ist auskommentiert
+# einfache Relationen sind auskommentiert, um die Verarbeitung zu beschleunigen
 # existierende Relationen sind auskommentiert, um die Verarbeitung zu beschleunigen
